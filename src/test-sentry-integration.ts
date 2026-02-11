@@ -32,3 +32,4 @@ export function trackEvent() {
   // This would be incorrect if we were using metrics
   // Sentry.metrics.increment('test.event') // Missing value parameter
 }
+// Trigger Seer analysis after configuration
