@@ -6,6 +6,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import * as Sentry from '@sentry/nextjs'
 
 interface Message {
   id: string
@@ -58,6 +59,32 @@ export function Chat() {
   const [currentTool, setCurrentTool] = useState<ToolStatus | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const [sessionId] = useState(() => crypto.randomUUID())
+
+  // Track component lifecycle
+  useEffect(() => {
+    Sentry.addBreadcrumb({
+      category: 'chat.component',
+      message: 'Chat component mounted',
+      level: 'info',
+      data: {
+        session_id: sessionId,
+        timestamp: new Date().toISOString(),
+      },
+    })
+
+    return () => {
+      Sentry.addBreadcrumb({
+        category: 'chat.component',
+        message: 'Chat component unmounted',
+        level: 'info',
+        data: {
+          session_id: sessionId,
+          timestamp: new Date().toISOString(),
+        },
+      })
+    }
+  }, [sessionId])
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -67,10 +94,11 @@ export function Chat() {
     scrollToBottom()
   }, [messages, currentTool])
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent, submissionMethod: 'button' | 'enter' = 'button') => {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
+    const messageStartTime = Date.now()
     const userMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -78,11 +106,30 @@ export function Chat() {
       timestamp: new Date()
     }
 
+    // Log message submission
+    Sentry.addBreadcrumb({
+      category: 'chat.message',
+      message: 'Message submitted',
+      level: 'info',
+      data: {
+        session_id: sessionId,
+        message_id: userMessage.id,
+        message_length: userMessage.content.length,
+        conversation_length: messages.length,
+        submission_method: submissionMethod,
+      },
+    })
+    Sentry.setContext('chat_session', {
+      session_id: sessionId,
+      message_count: messages.length + 1,
+    })
+
     setMessages(prev => [...prev, userMessage])
     setInput('')
     setIsLoading(true)
     setCurrentTool(null)
 
+    const fetchStartTime = Date.now()
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -97,9 +144,35 @@ export function Chat() {
         })
       })
 
+      const fetchDuration = (Date.now() - fetchStartTime) / 1000
+
       if (!response.ok) {
+        Sentry.addBreadcrumb({
+          category: 'chat.api',
+          message: 'API fetch error',
+          level: 'error',
+          data: {
+            session_id: sessionId,
+            message_id: userMessage.id,
+            status: response.status,
+            status_text: response.statusText,
+            fetch_duration_seconds: fetchDuration,
+          },
+        })
         throw new Error('Failed to get response')
       }
+
+      Sentry.addBreadcrumb({
+        category: 'chat.api',
+        message: 'API response received',
+        level: 'info',
+        data: {
+          session_id: sessionId,
+          message_id: userMessage.id,
+          status: response.status,
+          fetch_duration_seconds: fetchDuration,
+        },
+      })
 
       // Handle SSE streaming response
       const reader = response.body?.getReader()
@@ -108,9 +181,24 @@ export function Chat() {
       }
 
       const decoder = new TextDecoder()
+      const streamProcessingStartTime = Date.now()
       let streamingContent = ''
+      let streamChunkCount = 0
+      let streamParseErrorCount = 0
+      let streamContentLength = 0
       const streamingMessageId = crypto.randomUUID()
-      
+
+      Sentry.addBreadcrumb({
+        category: 'chat.stream',
+        message: 'Stream processing started',
+        level: 'info',
+        data: {
+          session_id: sessionId,
+          message_id: userMessage.id,
+          streaming_message_id: streamingMessageId,
+        },
+      })
+
       // Add a placeholder message for streaming content
       setMessages(prev => [...prev, {
         id: streamingMessageId,
@@ -123,28 +211,52 @@ export function Chat() {
         const { done, value } = await reader.read()
         if (done) break
 
+        streamChunkCount++
         const chunk = decoder.decode(value)
         const lines = chunk.split('\n')
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             const data = line.slice(6)
-            if (data === '[DONE]') continue
+            if (data === '[DONE]') {
+              Sentry.addBreadcrumb({
+                category: 'chat.stream',
+                message: '[DONE] marker received',
+                level: 'info',
+                data: {
+                  session_id: sessionId,
+                  message_id: userMessage.id,
+                  streaming_message_id: streamingMessageId,
+                },
+              })
+              continue
+            }
 
             try {
               const parsed = JSON.parse(data)
-              
+
               if (parsed.type === 'text_delta') {
                 // Append streaming text
                 streamingContent += parsed.text
+                streamContentLength += parsed.text.length
                 setCurrentTool(null) // Clear tool status when text starts flowing
                 // Update the streaming message
-                setMessages(prev => prev.map(msg => 
-                  msg.id === streamingMessageId 
+                setMessages(prev => prev.map(msg =>
+                  msg.id === streamingMessageId
                     ? { ...msg, content: streamingContent }
                     : msg
                 ))
               } else if (parsed.type === 'tool_start') {
+                Sentry.addBreadcrumb({
+                  category: 'chat.tool',
+                  message: `Tool start received: ${parsed.tool}`,
+                  level: 'info',
+                  data: {
+                    session_id: sessionId,
+                    message_id: userMessage.id,
+                    tool_name: parsed.tool,
+                  },
+                })
                 setCurrentTool({
                   name: parsed.tool,
                   status: 'running'
@@ -157,26 +269,104 @@ export function Chat() {
               } else if (parsed.type === 'done') {
                 setCurrentTool(null)
               } else if (parsed.type === 'error') {
+                Sentry.addBreadcrumb({
+                  category: 'chat.stream',
+                  message: 'Stream error received',
+                  level: 'error',
+                  data: {
+                    session_id: sessionId,
+                    message_id: userMessage.id,
+                    error_message: parsed.message,
+                  },
+                })
                 streamingContent = 'Sorry, I encountered an error processing your request.'
-                setMessages(prev => prev.map(msg => 
-                  msg.id === streamingMessageId 
+                setMessages(prev => prev.map(msg =>
+                  msg.id === streamingMessageId
                     ? { ...msg, content: streamingContent }
                     : msg
                 ))
                 setCurrentTool(null)
               }
-            } catch {
-              // Ignore parse errors for incomplete chunks
+            } catch (parseError) {
+              streamParseErrorCount++
+              // Log every 10th parse error to avoid spam
+              if (streamParseErrorCount % 10 === 0) {
+                Sentry.addBreadcrumb({
+                  category: 'chat.stream',
+                  message: 'Stream parse errors',
+                  level: 'warning',
+                  data: {
+                    session_id: sessionId,
+                    message_id: userMessage.id,
+                    parse_error_count: streamParseErrorCount,
+                  },
+                })
+              }
             }
           }
         }
       }
 
+      // Log stream completion
+      const streamProcessingDuration = (Date.now() - streamProcessingStartTime) / 1000
+      Sentry.addBreadcrumb({
+        category: 'chat.stream',
+        message: 'Stream processing completed',
+        level: 'info',
+        data: {
+          session_id: sessionId,
+          message_id: userMessage.id,
+          streaming_message_id: streamingMessageId,
+          chunk_count: streamChunkCount,
+          content_length: streamContentLength,
+          parse_error_count: streamParseErrorCount,
+          processing_duration_seconds: streamProcessingDuration,
+        },
+      })
+
+      // Track total message duration
+      const totalMessageDuration = (Date.now() - messageStartTime) / 1000
+      Sentry.addBreadcrumb({
+        category: 'chat.message',
+        message: 'Message completed',
+        level: 'info',
+        data: {
+          session_id: sessionId,
+          message_id: userMessage.id,
+          total_duration_seconds: totalMessageDuration,
+        },
+      })
+
       // If no content was streamed, remove the placeholder
       if (!streamingContent) {
         setMessages(prev => prev.filter(msg => msg.id !== streamingMessageId))
       }
-    } catch {
+    } catch (error) {
+      Sentry.addBreadcrumb({
+        category: 'chat.submit',
+        message: 'Submit error',
+        level: 'error',
+        data: {
+          session_id: sessionId,
+          message_id: userMessage.id,
+          error_name: error instanceof Error ? error.name : 'Unknown',
+          error_message: error instanceof Error ? error.message : 'Unknown error',
+        },
+      })
+      Sentry.captureException(error, {
+        tags: {
+          session_id: sessionId,
+          component: 'Chat',
+          error_location: 'handleSubmit',
+        },
+        contexts: {
+          chat: {
+            message_count: messages.length,
+            message_length: userMessage.content.length,
+          },
+        },
+      })
+
       const errorMessage: Message = {
         id: crypto.randomUUID(),
         role: 'assistant',
@@ -193,7 +383,7 @@ export function Chat() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      handleSubmit(e)
+      handleSubmit(e, 'enter')
     }
   }
 

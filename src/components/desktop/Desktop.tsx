@@ -7,7 +7,8 @@ import { DesktopIcon } from './DesktopIcon'
 import { Notepad } from './apps/Notepad'
 import { FolderView, FolderItem } from './apps/FolderView'
 import { Chat } from './apps/Chat'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import * as Sentry from '@sentry/nextjs'
 
 const INSTALL_GUIDE_CONTENT = `# SentryOS Install Guide
 
@@ -57,8 +58,43 @@ All text uses **JetBrains Mono** for that authentic terminal feel.
 function DesktopContent() {
   const { windows, openWindow } = useWindowManager()
   const [selectedIcon, setSelectedIcon] = useState<string | null>(null)
+  const [sessionStartTime] = useState(() => Date.now())
+
+  // Track desktop lifecycle
+  useEffect(() => {
+    Sentry.addBreadcrumb({
+      category: 'desktop',
+      message: 'Desktop mounted',
+      level: 'info',
+      data: {
+        timestamp: new Date().toISOString(),
+      },
+    })
+
+    return () => {
+      const sessionDuration = (Date.now() - sessionStartTime) / 1000
+      Sentry.addBreadcrumb({
+        category: 'desktop',
+        message: 'Desktop unmounted',
+        level: 'info',
+        data: {
+          timestamp: new Date().toISOString(),
+          session_duration_seconds: sessionDuration,
+        },
+      })
+    }
+  }, [sessionStartTime])
 
   const openInstallGuide = () => {
+    Sentry.addBreadcrumb({
+      category: 'desktop.app',
+      message: 'Desktop app opened',
+      level: 'info',
+      data: {
+        app_type: 'install-guide',
+        app_name: 'Install Guide.md',
+      },
+    })
     openWindow({
       id: 'install-guide',
       title: 'Install Guide.md',
@@ -76,6 +112,15 @@ function DesktopContent() {
   }
 
   const openChatWindow = () => {
+    Sentry.addBreadcrumb({
+      category: 'desktop.app',
+      message: 'Desktop app opened',
+      level: 'info',
+      data: {
+        app_type: 'chat',
+        app_name: 'SentryOS Chat',
+      },
+    })
     openWindow({
       id: 'chat',
       title: 'SentryOS Chat',
@@ -93,6 +138,15 @@ function DesktopContent() {
   }
 
   const openAgentsFolder = () => {
+    Sentry.addBreadcrumb({
+      category: 'desktop.app',
+      message: 'Desktop app opened',
+      level: 'info',
+      data: {
+        app_type: 'agents-folder',
+        app_name: 'Agents',
+      },
+    })
     const agentsFolderItems: FolderItem[] = []
 
     openWindow({
@@ -112,6 +166,11 @@ function DesktopContent() {
   }
 
   const handleDesktopClick = () => {
+    Sentry.addBreadcrumb({
+      category: 'desktop',
+      message: 'Desktop background clicked',
+      level: 'info',
+    })
     setSelectedIcon(null)
   }
 

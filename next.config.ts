@@ -29,7 +29,9 @@ export default withSentryConfig(nextConfig, {
   tunnelRoute: "/monitoring",
 
   // Hides source maps from generated client bundles
-  hideSourceMaps: true,
+  sourcemaps: {
+    disable: true,
+  },
 
   // Webpack-specific options
   webpack: {
